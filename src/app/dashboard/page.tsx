@@ -1,5 +1,7 @@
 import { PipelineStateEnum } from '@/schemas/pipeline'
-import type { PipelineState } from '@/schemas/pipeline'
+import { supabase } from '@/integrations/supabase'
+
+export const dynamic = 'force-dynamic'
 
 // ─── Stage colour map ────────────────────────────────────────────────────────
 const STATE_COLOR: Record<string, string> = {
@@ -32,27 +34,87 @@ const STATE_COLOR: Record<string, string> = {
   CLOSED_DROPPED:         'bg-gray-800 text-gray-400',
 }
 
-// ─── Mock data (replace with real Ceipal + DB queries) ──────────────────────
-const MOCK_STATS = [
-  { label: 'Active Jobs',         value: 12, change: '+3 this week' },
-  { label: 'Candidates in Pipe',  value: 87, change: '+14 this week' },
-  { label: 'CVs Submitted',       value: 23, change: 'this month' },
-  { label: 'Placements (MTD)',     value: 4,  change: '₹2.1L invoiced' },
-]
+const TERMINAL = new Set(['CLOSED_PLACED', 'CLOSED_DROPPED'])
 
-const MOCK_JOBS = [
-  { id: 'J001', title: 'VP Sales', client: 'Confidential BFSI', candidates: 8,  hotState: 'INTERVIEW_ROUNDS', updatedAgo: '2h' },
-  { id: 'J002', title: 'Senior React Developer', client: 'Tech Startup', candidates: 14, hotState: 'CV_SUBMITTED', updatedAgo: '45m' },
-  { id: 'J003', title: 'Finance Controller', client: 'Mfg Co.', candidates: 5,  hotState: 'OFFER_STAGE', updatedAgo: '1d' },
-  { id: 'J004', title: 'HR Business Partner', client: 'FMCG Giant', candidates: 11, hotState: 'CALLING', updatedAgo: '3h' },
-]
+function timeAgo(iso: string): string {
+  const diffMs = Date.now() - new Date(iso).getTime()
+  const mins   = Math.floor(diffMs / 60_000)
+  if (mins < 60)   return `${mins}m`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24)    return `${hrs}h`
+  return `${Math.floor(hrs / 24)}d`
+}
 
-const MOCK_ESCALATIONS = [
-  { candidateName: 'Rahul Sharma', role: 'VP Sales', reason: 'Salary expectation 18% above band', time: '1h ago' },
-  { candidateName: 'Priya Iyer',   role: 'React Dev',  reason: 'Candidate asked about work-from-home policy', time: '3h ago' },
-]
+export default async function DashboardPage() {
+  // ── Fetch all pipeline records ───────────────────────────────────────────
+  const [{ data: records }, { data: escalations }] = await Promise.all([
+    supabase
+      .from('pipeline_records')
+      .select('job_id, candidate_id, state, updated_at, jd_snapshot')
+      .order('updated_at', { ascending: false }),
+    supabase
+      .from('escalations')
+      .select('id, job_id, candidate_id, candidate_name, job_title, reason, pipeline_state, created_at')
+      .eq('status', 'open')
+      .order('created_at', { ascending: false })
+      .limit(10),
+  ])
 
-export default function DashboardPage() {
+  const allRecords = records ?? []
+
+  // ── Aggregate stats ──────────────────────────────────────────────────────
+  const activeJobIds = new Set(
+    allRecords.filter((r) => !TERMINAL.has(r.state)).map((r) => r.job_id)
+  )
+  const candidatesInPipe = allRecords.filter((r) => !TERMINAL.has(r.state)).length
+  const cvsSubmitted     = allRecords.filter((r) =>
+    ['CV_SUBMITTED', 'CV_SHORTLISTED', 'CV_REFINED', 'CV_REJECTED',
+     'INTERVIEW_SCHEDULED', 'INTERVIEW_ROUNDS', 'SELECTED', 'REJECTED',
+     'DOCUMENTATION', 'OFFER_STAGE', 'NEGOTIATION_POSITIVE', 'NEGOTIATION_NEGATIVE',
+     'OFFER_ACCEPTED', 'NOT_POSITIVE', 'DOJ_CONFIRMED', 'INVOICE_RAISED',
+     'PAYMENT_FOLLOWUP', 'CLOSED_PLACED'].includes(r.state)
+  ).length
+  const startOfMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString()
+  const placementsMTD = allRecords.filter(
+    (r) => r.state === 'CLOSED_PLACED' && r.updated_at >= startOfMonth
+  ).length
+
+  const stats = [
+    { label: 'Active Jobs',        value: activeJobIds.size,    change: 'currently open' },
+    { label: 'Candidates in Pipe', value: candidatesInPipe,     change: 'active pipeline' },
+    { label: 'CVs Submitted',      value: cvsSubmitted,         change: 'total pipeline' },
+    { label: 'Placements (MTD)',   value: placementsMTD,        change: 'this month' },
+  ]
+
+  // ── Build jobs table ─────────────────────────────────────────────────────
+  const jobMap = new Map<string, {
+    jobId: string; title: string; activeCandidates: number; hotState: string; latestUpdate: string
+  }>()
+  for (const r of allRecords) {
+    const existing = jobMap.get(r.job_id)
+    const snap = r.jd_snapshot as Record<string, unknown> | null
+    if (!existing) {
+      jobMap.set(r.job_id, {
+        jobId:            r.job_id,
+        title:            (snap?.title as string) ?? r.job_id,
+        activeCandidates: TERMINAL.has(r.state) ? 0 : 1,
+        hotState:         r.state,
+        latestUpdate:     r.updated_at,
+      })
+    } else {
+      if (!TERMINAL.has(r.state)) existing.activeCandidates++
+      if (r.updated_at > existing.latestUpdate) {
+        existing.latestUpdate = r.updated_at
+        existing.hotState     = r.state
+      }
+    }
+  }
+  const jobs = [...jobMap.values()]
+    .filter((j) => !TERMINAL.has(j.hotState) || j.activeCandidates > 0)
+    .slice(0, 20)
+
+  const openEscalations = escalations ?? []
+
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-8">
       {/* Header */}
@@ -63,7 +125,7 @@ export default function DashboardPage() {
 
       {/* Stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        {MOCK_STATS.map((s) => (
+        {stats.map((s) => (
           <div key={s.label} className="bg-[#1a1d26] border border-[#2a2d3a] rounded-xl p-4">
             <div className="text-3xl font-bold text-green-400">{s.value}</div>
             <div className="text-sm font-medium mt-1">{s.label}</div>
@@ -76,61 +138,66 @@ export default function DashboardPage() {
       <div>
         <h2 className="text-lg font-semibold mb-3">Active Jobs</h2>
         <div className="bg-[#1a1d26] border border-[#2a2d3a] rounded-xl overflow-hidden">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-[#2a2d3a] text-[#8b8fa8]">
-                <th className="text-left px-4 py-3 font-medium">Job</th>
-                <th className="text-left px-4 py-3 font-medium">Client</th>
-                <th className="text-left px-4 py-3 font-medium">Pipeline Stage</th>
-                <th className="text-right px-4 py-3 font-medium">Candidates</th>
-                <th className="text-right px-4 py-3 font-medium">Updated</th>
-              </tr>
-            </thead>
-            <tbody>
-              {MOCK_JOBS.map((job) => (
-                <tr key={job.id} className="border-b border-[#2a2d3a] hover:bg-[#20242f] transition-colors">
-                  <td className="px-4 py-3">
-                    <a href={`/dashboard/jobs/${job.id}`} className="font-medium hover:text-green-400 transition-colors">
-                      {job.title}
-                    </a>
-                    <div className="text-xs text-[#8b8fa8]">{job.id}</div>
-                  </td>
-                  <td className="px-4 py-3 text-[#8b8fa8]">{job.client}</td>
-                  <td className="px-4 py-3">
-                    <span className={`text-xs px-2 py-1 rounded-full font-medium ${STATE_COLOR[job.hotState] ?? 'bg-gray-700 text-gray-300'}`}>
-                      {job.hotState.replace(/_/g, ' ')}
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-right tabular-nums">{job.candidates}</td>
-                  <td className="px-4 py-3 text-right text-[#8b8fa8]">{job.updatedAgo}</td>
+          {jobs.length === 0 ? (
+            <p className="text-[#8b8fa8] text-sm px-4 py-8 text-center">No active jobs yet. Trigger a pipeline to get started.</p>
+          ) : (
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b border-[#2a2d3a] text-[#8b8fa8]">
+                  <th className="text-left px-4 py-3 font-medium">Job</th>
+                  <th className="text-left px-4 py-3 font-medium">Pipeline Stage</th>
+                  <th className="text-right px-4 py-3 font-medium">Active</th>
+                  <th className="text-right px-4 py-3 font-medium">Updated</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {jobs.map((job) => (
+                  <tr key={job.jobId} className="border-b border-[#2a2d3a] hover:bg-[#20242f] transition-colors">
+                    <td className="px-4 py-3">
+                      <a href={`/dashboard/jobs/${job.jobId}`} className="font-medium hover:text-green-400 transition-colors">
+                        {job.title}
+                      </a>
+                      <div className="text-xs text-[#8b8fa8]">{job.jobId}</div>
+                    </td>
+                    <td className="px-4 py-3">
+                      <span className={`text-xs px-2 py-1 rounded-full font-medium ${STATE_COLOR[job.hotState] ?? 'bg-gray-700 text-gray-300'}`}>
+                        {job.hotState.replace(/_/g, ' ')}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 text-right tabular-nums">{job.activeCandidates}</td>
+                    <td className="px-4 py-3 text-right text-[#8b8fa8]">{timeAgo(job.latestUpdate)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
         </div>
       </div>
 
       {/* Escalation Queue */}
-      {MOCK_ESCALATIONS.length > 0 && (
+      {openEscalations.length > 0 && (
         <div>
           <h2 className="text-lg font-semibold mb-3 flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse inline-block" />
             Escalation Queue
-            <span className="text-xs bg-red-900 text-red-300 px-2 py-0.5 rounded-full">{MOCK_ESCALATIONS.length}</span>
+            <span className="text-xs bg-red-900 text-red-300 px-2 py-0.5 rounded-full">{openEscalations.length}</span>
           </h2>
           <div className="space-y-2">
-            {MOCK_ESCALATIONS.map((e, i) => (
-              <div key={i} className="bg-[#1a1d26] border border-red-900/50 rounded-xl px-4 py-3 flex items-center justify-between">
+            {openEscalations.map((e) => (
+              <div key={e.id} className="bg-[#1a1d26] border border-red-900/50 rounded-xl px-4 py-3 flex items-center justify-between">
                 <div>
-                  <span className="font-medium">{e.candidateName}</span>
-                  <span className="text-[#8b8fa8] text-sm ml-2">— {e.role}</span>
+                  <span className="font-medium">{e.candidate_name ?? e.candidate_id}</span>
+                  {e.job_title && <span className="text-[#8b8fa8] text-sm ml-2">— {e.job_title}</span>}
                   <div className="text-sm text-red-400 mt-0.5">{e.reason}</div>
                 </div>
                 <div className="flex items-center gap-3">
-                  <span className="text-xs text-[#8b8fa8]">{e.time}</span>
-                  <button className="text-xs bg-green-700 hover:bg-green-600 text-white px-3 py-1.5 rounded-lg transition-colors">
+                  <span className="text-xs text-[#8b8fa8]">{timeAgo(e.created_at)}</span>
+                  <a
+                    href={`/dashboard/jobs/${e.job_id}`}
+                    className="text-xs bg-green-700 hover:bg-green-600 text-white px-3 py-1.5 rounded-lg transition-colors"
+                  >
                     Review
-                  </button>
+                  </a>
                 </div>
               </div>
             ))}

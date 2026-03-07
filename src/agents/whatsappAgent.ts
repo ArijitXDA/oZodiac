@@ -2,7 +2,7 @@ import { generateText, tool } from 'ai'
 import { z } from 'zod'
 import { anthropic, DEFAULT_MODEL } from '@/lib/llm'
 import { whatsapp } from '@/integrations/whatsapp'
-import { ceipal } from '@/integrations/ceipal'
+import { supabase } from '@/integrations/supabase'
 import { logger } from '@/lib/logger'
 import type { JD } from '@/schemas/jd'
 import type { Candidate } from '@/schemas/candidate'
@@ -43,6 +43,17 @@ class WhatsAppChatAgent {
   }> {
     logger.info(AGENT, `Initiating contact with ${context.candidate.name}`)
 
+    // ── Register phone number in lookup table before first message ───────────
+    await supabase.from('candidate_phone_lookup').upsert({
+      phone:               context.candidate.phone,
+      candidate_id:        context.candidate.id,
+      job_id:              context.jobId,
+      candidate_name:      context.candidate.name,
+      candidate_email:     context.candidate.email,
+      is_active:           true,
+      updated_at:          new Date().toISOString(),
+    }, { onConflict: 'phone' })
+
     const { text } = await generateText({
       model:  anthropic(DEFAULT_MODEL),
       system: this.systemPrompt(context),
@@ -76,10 +87,16 @@ Return ONLY the message text, nothing else.`,
     const { candidate, jd, jobId, currentState, incomingMessage } = context
     logger.info(AGENT, `Handling reply from ${candidate.name}`, { state: currentState })
 
-    // Load conversation history from Ceipal
-    const historyRaw = await ceipal.getConversationHistory(candidate.id, jobId)
+    // Load conversation history from Supabase pipeline_records
+    const { data: row } = await supabase
+      .from('pipeline_records')
+      .select('conversation_history')
+      .eq('candidate_id', candidate.id)
+      .eq('job_id', jobId)
+      .single()
+
     const history: Array<{ role: 'user' | 'assistant'; content: string }> =
-      historyRaw ? JSON.parse(historyRaw) : []
+      Array.isArray(row?.conversation_history) ? row.conversation_history as Array<{ role: 'user' | 'assistant'; content: string }> : []
 
     // Append incoming message
     if (incomingMessage) {
@@ -147,9 +164,13 @@ Determine:
     const nextState = this.extractNextState(text)
     const flagged   = text.includes('flagForHumanReview')
 
-    // Persist updated history
+    // Persist updated history to Supabase
     history.push({ role: 'assistant', content: text })
-    await ceipal.saveConversationHistory(candidate.id, jobId, JSON.stringify(history))
+    await supabase
+      .from('pipeline_records')
+      .update({ conversation_history: history, updated_at: new Date().toISOString() })
+      .eq('candidate_id', candidate.id)
+      .eq('job_id', jobId)
 
     return {
       reply:         text,
@@ -221,11 +242,11 @@ Please confirm if you'd like to proceed. We'll share full details on confirmatio
     ctx: Omit<ConversationContext, 'incomingMessage'>,
     messages: Array<{ role: string; content: string }>
   ): Promise<void> {
-    await ceipal.saveConversationHistory(
-      ctx.candidate.id,
-      ctx.jobId,
-      JSON.stringify(messages)
-    )
+    await supabase
+      .from('pipeline_records')
+      .update({ conversation_history: messages, updated_at: new Date().toISOString() })
+      .eq('candidate_id', ctx.candidate.id)
+      .eq('job_id', ctx.jobId)
   }
 }
 

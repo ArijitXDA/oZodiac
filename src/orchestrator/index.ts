@@ -6,11 +6,14 @@ import { emailAgent } from '@/agents/emailAgent'
 import { groomingAgent } from '@/agents/groomingAgent'
 import { schedulingAgent } from '@/agents/schedulingAgent'
 import { feedbackAgent } from '@/agents/feedbackAgent'
+import { voiceAgent } from '@/agents/voiceAgent'
+import { marketIntelAgent } from '@/agents/marketIntelAgent'
 import { ceipal } from '@/integrations/ceipal'
 import { logger } from '@/lib/logger'
 import type { PipelineRecord } from '@/schemas/pipeline'
 import type { JD } from '@/schemas/jd'
 import type { Candidate } from '@/schemas/candidate'
+import type { MarketIntel } from '@/agents/marketIntelAgent'
 
 const AGENT = 'Orchestrator'
 
@@ -18,21 +21,34 @@ export class PipelineOrchestrator {
   /**
    * Stage 1: Process a newly received JD.
    * JD_RECEIVED → JD_PROCESSED
+   * Runs JD parsing and market intel in parallel; merges both into jd_snapshot.
    */
-  async processJD(record: PipelineRecord, rawJDText: string): Promise<{ record: PipelineRecord; jd: JD }> {
+  async processJD(
+    record: PipelineRecord,
+    rawJDText: string
+  ): Promise<{ record: PipelineRecord; jd: JD; marketIntel: MarketIntel }> {
     logger.info(AGENT, 'Processing JD', { jobId: record.jobId })
+
     const jd = await jdParserAgent.parse(rawJDText)
+
+    // Run market intel in parallel after JD is parsed (needs structured JD)
+    const marketIntel = await marketIntelAgent.analyze(jd)
+
+    const jdSnapshot = { ...jd, marketIntel }
+
     const updated = await stateMachine.transition(record, 'JD_PROCESSED', {
       triggeredBy: 'agent',
-      actorId: 'jd-parser-agent',
-      notes: `JD parsed. Title: ${jd.title}. Skills: ${jd.skills.must.join(', ')}. Boolean: ${jd.booleanSearchString}`,
+      actorId:     'jd-parser-agent',
+      notes:       `JD parsed. Title: ${jd.title}. Skills: ${jd.skills.must.join(', ')}. Sourcing difficulty: ${marketIntel.sourcingDifficultyScore}/10.`,
+      jdSnapshot,
     })
-    return { record: updated, jd }
+    return { record: updated, jd, marketIntel }
   }
 
   /**
    * Stage 2: Score a list of candidate resumes against the parsed JD.
    * JD_PROCESSED → SOURCING → RESUME_MATCHED
+   * Passes market intel from jd_snapshot to the scorer when available.
    */
   async scoreResumes(
     record: PipelineRecord,
@@ -44,13 +60,29 @@ export class PipelineOrchestrator {
       triggeredBy: 'agent',
       notes: `${candidates.length} candidates pulled for evaluation`,
     })
-    const scores = await resumeScorerAgent.score(jd, candidates)
+    const marketIntel = (record.jdSnapshot as { marketIntel?: MarketIntel } | null)?.marketIntel
+    const scores = await resumeScorerAgent.score(jd, candidates, marketIntel)
     const shortlisted = scores.candidates.filter((c) => c.shouldShortlist)
     return stateMachine.transition(sourcing, 'RESUME_MATCHED', {
       triggeredBy: 'agent',
       actorId: 'resume-scorer-agent',
       notes: `${shortlisted.length}/${scores.totalEvaluated} candidates shortlisted. Top score: ${Math.max(...shortlisted.map((c) => c.overallScore)).toFixed(1)}`,
     })
+  }
+
+  /**
+   * Stage 2b: Initiate outbound voice call to a candidate.
+   * Upserts phone lookup, triggers Vapi call, persists callId.
+   * State transition (CALLING → CONSENTED / NOT_INTERESTED / NOT_REACHED) is
+   * handled asynchronously by the /api/webhooks/vapi route.
+   */
+  async initiateVoiceOutreach(
+    candidate: Candidate,
+    jd: JD,
+    jobId: string
+  ): Promise<{ callId: string }> {
+    logger.info(AGENT, 'Initiating voice outreach', { candidateId: candidate.id, jobId })
+    return voiceAgent.initiateOutreach(candidate, jd, jobId)
   }
 
   /**

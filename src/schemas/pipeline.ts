@@ -85,6 +85,7 @@ export const PipelineRecordSchema = z.object({
   interviewRound: z.number().default(0),
   ceipalJobId: z.string().optional(),
   ceipalCandidateId: z.string().optional(),
+  jdSnapshot: z.record(z.unknown()).optional().describe('Parsed JD + market intel merged JSON'),
 })
 
 export type PipelineRecord = z.infer<typeof PipelineRecordSchema>

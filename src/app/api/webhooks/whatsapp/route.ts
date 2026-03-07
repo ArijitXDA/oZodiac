@@ -1,8 +1,12 @@
 import { NextRequest, NextResponse } from 'next/server'
+
+export const dynamic = 'force-dynamic'
 import { whatsapp } from '@/integrations/whatsapp'
 import { whatsappChatAgent } from '@/agents/whatsappAgent'
-import { ceipal } from '@/integrations/ceipal'
+import { stateMachine } from '@/orchestrator/stateMachine'
+import { supabase } from '@/integrations/supabase'
 import { logger } from '@/lib/logger'
+import type { PipelineState } from '@/schemas/pipeline'
 
 const AGENT = 'WhatsAppWebhook'
 
@@ -11,10 +15,10 @@ const AGENT = 'WhatsAppWebhook'
  * Meta webhook verification challenge.
  */
 export async function GET(req: NextRequest) {
-  const params      = req.nextUrl.searchParams
-  const mode        = params.get('hub.mode')
-  const token       = params.get('hub.verify_token')
-  const challenge   = params.get('hub.challenge')
+  const params    = req.nextUrl.searchParams
+  const mode      = params.get('hub.mode')
+  const token     = params.get('hub.verify_token')
+  const challenge = params.get('hub.challenge')
 
   if (mode === 'subscribe' && token === process.env.WHATSAPP_VERIFY_TOKEN) {
     logger.info(AGENT, 'Webhook verified')
@@ -26,62 +30,82 @@ export async function GET(req: NextRequest) {
 /**
  * POST /api/webhooks/whatsapp
  * Handles incoming WhatsApp messages.
+ * Looks up (candidateId, jobId) from candidate_phone_lookup, loads the real
+ * PipelineRecord from Supabase, then routes to the WhatsApp chat agent.
  */
 export async function POST(req: NextRequest) {
   const body = await req.json()
   const msg  = whatsapp.parseWebhookPayload(body)
 
-  if (!msg) {
-    return NextResponse.json({ status: 'ignored' })
-  }
+  if (!msg) return NextResponse.json({ status: 'ignored' })
 
   logger.info(AGENT, `Incoming message from ${msg.from}`, { preview: msg.text.slice(0, 60) })
 
-  // Look up candidate by phone number in Ceipal
-  let candidate = null
-  let jobId     = null
+  // ── Look up candidate via E.164 phone number ─────────────────────────────
+  const { data: lookup, error: lookupErr } = await supabase
+    .from('candidate_phone_lookup')
+    .select('*')
+    .eq('phone', msg.from)
+    .eq('is_active', true)
+    .single()
 
-  try {
-    const candidates = await ceipal.searchCandidates({ keyword: msg.from })
-    candidate = candidates[0] ?? null
-    // TODO: In production, maintain a phone→(candidateId, jobId) lookup table
-    jobId = candidate ? 'active-job' : null
-  } catch (err) {
-    logger.error(AGENT, 'Ceipal lookup failed', err)
-  }
-
-  if (!candidate || !jobId) {
-    // Unknown sender — log and ignore
-    logger.warn(AGENT, `No candidate found for phone ${msg.from}`)
+  if (lookupErr || !lookup) {
+    logger.warn(AGENT, `No active phone lookup for ${msg.from}`)
     return NextResponse.json({ status: 'unknown_sender' })
   }
 
-  // Route to WhatsApp chat agent asynchronously
-  // (don't await — Meta expects 200 within 5s)
+  // ── Load real pipeline record from Supabase ───────────────────────────────
+  const record = await stateMachine.getRecord(lookup.job_id, lookup.candidate_id)
+
+  if (!record) {
+    logger.warn(AGENT, `No pipeline record for job=${lookup.job_id} candidate=${lookup.candidate_id}`)
+    return NextResponse.json({ status: 'no_record' })
+  }
+
+  // Return 200 immediately — Meta requires response within 5 s
   setImmediate(async () => {
     try {
       const result = await whatsappChatAgent.handleReply({
         candidate: {
-          id:              candidate!.candidate_id,
-          name:            `${candidate!.first_name} ${candidate!.last_name}`,
+          id:              lookup.candidate_id,
+          name:            lookup.candidate_name ?? lookup.candidate_id,
           phone:           msg.from,
-          email:           candidate!.email,
-          currentCTC:      candidate!.current_ctc    ?? 0,
-          expectedCTC:     candidate!.expected_ctc   ?? 0,
-          currentEmployer: candidate!.current_employer    ?? '',
-          currentTitle:    candidate!.current_designation ?? '',
-          totalExperience: candidate!.total_experience    ?? 0,
-          noticePeriod:    candidate!.notice_period       ?? 90,
-          location:        candidate!.location            ?? '',
+          email:           lookup.candidate_email ?? '',
+          currentCTC:      0,
+          expectedCTC:     0,
+          currentEmployer: '',
+          currentTitle:    '',
+          totalExperience: 0,
+          noticePeriod:    90,
+          location:        '',
         },
-        jd:             {} as never, // loaded from active pipeline record in production
-        jobId:          jobId!,
-        currentState:   'CALLING',   // loaded from active pipeline record in production
+        jd:              (record.jdSnapshot ?? {}) as never,
+        jobId:           lookup.job_id,
+        currentState:    record.state,
         incomingMessage: msg.text,
       })
 
+      // Advance state if agent returned a valid transition
+      if (result.nextState && stateMachine.canTransition(record.state, result.nextState as PipelineState)) {
+        await stateMachine.transition(record, result.nextState as PipelineState, {
+          triggeredBy: 'agent',
+          actorId:     'whatsapp-chat-agent',
+          notes:       `WhatsApp conversation. New state: ${result.nextState}`,
+        })
+      }
+
+      // Create escalation if agent flagged for human review
       if (result.flagForHuman) {
-        logger.warn(AGENT, `Flagged for human review`, { candidate: candidate!.candidate_id })
+        await supabase.from('escalations').insert({
+          job_id:         lookup.job_id,
+          candidate_id:   lookup.candidate_id,
+          flagged_by:     'whatsapp-chat-agent',
+          reason:         'Candidate conversation requires human review',
+          pipeline_state: record.state,
+          candidate_name: lookup.candidate_name,
+          status:         'open',
+        })
+        logger.warn(AGENT, `Escalation created for ${lookup.candidate_id}`)
       }
     } catch (err) {
       logger.error(AGENT, 'Agent reply failed', err)

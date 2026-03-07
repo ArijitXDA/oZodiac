@@ -1,15 +1,11 @@
 import { generateObject } from 'ai'
 import { z } from 'zod'
 import { anthropic, FAST_MODEL } from '@/lib/llm'
+import { supabase } from '@/integrations/supabase'
 import { logger } from '@/lib/logger'
-import { promises as fs } from 'fs'
-import path from 'path'
 import type { PipelineState } from '@/schemas/pipeline'
 
 const AGENT = 'FeedbackAgent'
-
-// Local feedback store (JSON file). In Phase 2 replace with vector DB.
-const FEEDBACK_FILE = path.join(process.cwd(), '.feedback-store.json')
 
 interface RejectionRecord {
   jobId:       string
@@ -24,8 +20,8 @@ const ClientPreferenceSchema = z.object({
   impliedSkillsToAvoid:     z.array(z.string()),
   impliedSkillsToEmphasize: z.array(z.string()),
   scoringAdjustments: z.object({
-    skillWeightDelta:       z.number().min(-20).max(20),
-    experienceWeightDelta:  z.number().min(-20).max(20),
+    skillWeightDelta:        z.number().min(-20).max(20),
+    experienceWeightDelta:   z.number().min(-20).max(20),
     compensationWeightDelta: z.number().min(-20).max(20),
   }),
   insight: z.string().describe('Key insight for the recruiter in plain English'),
@@ -35,7 +31,7 @@ export type ClientPreference = z.infer<typeof ClientPreferenceSchema>
 
 class FeedbackAgent {
   /**
-   * Log a rejection reason.
+   * Log a rejection reason to Supabase rejection_feedback.
    */
   async logRejection(params: {
     jobId: string
@@ -43,11 +39,14 @@ class FeedbackAgent {
     reason: string
     stage: PipelineState
   }): Promise<void> {
-    const record: RejectionRecord = { ...params, timestamp: new Date().toISOString() }
-    const store = await this.loadStore()
-    store.push(record)
-    await this.saveStore(store)
-    logger.info(AGENT, `Rejection logged`, { stage: params.stage, reason: params.reason.slice(0, 80) })
+    const { error } = await supabase.from('rejection_feedback').insert({
+      job_id:       params.jobId,
+      candidate_id: params.candidateId,
+      stage:        params.stage,
+      reason:       params.reason,
+    })
+    if (error) logger.error(AGENT, 'Failed to log rejection', error)
+    else logger.info(AGENT, 'Rejection logged', { stage: params.stage, reason: params.reason.slice(0, 80) })
   }
 
   /**
@@ -55,15 +54,23 @@ class FeedbackAgent {
    * Used to improve future resume scoring for the same client/role.
    */
   async analyzeRejections(jobId: string): Promise<ClientPreference | null> {
-    const store  = await this.loadStore()
-    const jobRej = store.filter((r) => r.jobId === jobId)
+    const { data: rows, error } = await supabase
+      .from('rejection_feedback')
+      .select('stage, reason, created_at')
+      .eq('job_id', jobId)
+      .order('created_at', { ascending: true })
 
-    if (jobRej.length < 2) {
-      logger.info(AGENT, `Not enough rejections to analyze (${jobRej.length})`)
+    if (error) {
+      logger.error(AGENT, 'Failed to load rejections', error)
       return null
     }
 
-    logger.info(AGENT, `Analyzing ${jobRej.length} rejections for job ${jobId}`)
+    if (!rows || rows.length < 2) {
+      logger.info(AGENT, `Not enough rejections to analyze (${rows?.length ?? 0})`)
+      return null
+    }
+
+    logger.info(AGENT, `Analyzing ${rows.length} rejections for job ${jobId}`)
 
     const { object } = await generateObject({
       model:  anthropic(FAST_MODEL),
@@ -72,7 +79,7 @@ class FeedbackAgent {
 for improving future candidate sourcing and scoring.
 
 REJECTION HISTORY (Job ID: ${jobId}):
-${jobRej.map((r, i) => `${i + 1}. [${r.stage}] ${r.reason}`).join('\n')}
+${rows.map((r, i) => `${i + 1}. [${r.stage}] ${r.reason}`).join('\n')}
 
 Identify:
 1. Recurring patterns in rejections
@@ -82,31 +89,32 @@ Identify:
 5. One plain-English insight for the recruiter`,
     })
 
-    logger.info(AGENT, `Analysis complete`, { insight: object.insight })
+    logger.info(AGENT, 'Analysis complete', { insight: object.insight })
     return object
   }
 
   /**
-   * Get rejection history for a job.
+   * Get rejection history for a job from Supabase.
    */
   async getRejections(jobId: string): Promise<RejectionRecord[]> {
-    const store = await this.loadStore()
-    return store.filter((r) => r.jobId === jobId)
-  }
+    const { data, error } = await supabase
+      .from('rejection_feedback')
+      .select('job_id, candidate_id, stage, reason, created_at')
+      .eq('job_id', jobId)
+      .order('created_at', { ascending: true })
 
-  // ─── Store helpers ───────────────────────────────────────────────────────
-
-  private async loadStore(): Promise<RejectionRecord[]> {
-    try {
-      const raw = await fs.readFile(FEEDBACK_FILE, 'utf-8')
-      return JSON.parse(raw)
-    } catch {
+    if (error) {
+      logger.error(AGENT, 'Failed to get rejections', error)
       return []
     }
-  }
 
-  private async saveStore(store: RejectionRecord[]): Promise<void> {
-    await fs.writeFile(FEEDBACK_FILE, JSON.stringify(store, null, 2))
+    return (data ?? []).map((r) => ({
+      jobId:       r.job_id,
+      candidateId: r.candidate_id,
+      stage:       r.stage as PipelineState,
+      reason:      r.reason,
+      timestamp:   r.created_at,
+    }))
   }
 }
 

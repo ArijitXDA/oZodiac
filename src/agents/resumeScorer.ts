@@ -4,10 +4,11 @@ import { ScoredCandidateListSchema, type ScoredCandidateList } from '@/schemas/c
 import { logger } from '@/lib/logger'
 import type { JD } from '@/schemas/jd'
 import type { Candidate } from '@/schemas/candidate'
+import type { MarketIntel } from '@/agents/marketIntelAgent'
 
 const AGENT = 'ResumeScorerAgent'
 
-const SYSTEM_PROMPT = `You are a senior recruitment consultant at Zodiac HRC.
+const BASE_SYSTEM_PROMPT = `You are a senior recruitment consultant at Zodiac HRC.
 Your job is to evaluate candidate profiles against job descriptions and produce objective scores.
 
 Scoring guidelines:
@@ -23,8 +24,18 @@ In shortlistReason, write a concise 1-2 sentence pitch that a recruiter can use 
 In redFlags, list only genuine mismatches (e.g. "10 LPA above budget", "No BFSI experience").`
 
 class ResumeScorerAgent {
-  async score(jd: JD, candidates: Candidate[]): Promise<ScoredCandidateList> {
+  async score(
+    jd: JD,
+    candidates: Candidate[],
+    marketIntel?: MarketIntel
+  ): Promise<ScoredCandidateList> {
     logger.info(AGENT, `Scoring ${candidates.length} candidates for "${jd.title}"`)
+
+    // Build system prompt — inject target company context when market intel is available
+    let systemPrompt = BASE_SYSTEM_PROMPT
+    if (marketIntel?.targetCompanies?.length) {
+      systemPrompt += `\n\nMarket Intel — Priority sourcing companies for this role:\n${marketIntel.targetCompanies.map((c) => `- ${c}`).join('\n')}\nCandidates from these companies should receive a +5 bonus to industryRelevance if all other factors are equal.`
+    }
 
     // Process in batches of 10 to stay within token limits
     const BATCH = 10
@@ -36,7 +47,7 @@ class ResumeScorerAgent {
       const { object } = await generateObject({
         model:  anthropic(DEFAULT_MODEL),
         schema: ScoredCandidateListSchema,
-        system: SYSTEM_PROMPT,
+        system: systemPrompt,
         prompt: `Evaluate these ${batch.length} candidates for the following role:
 
 JOB DESCRIPTION:

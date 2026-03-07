@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { orchestrator } from '@/orchestrator'
+
+export const dynamic = 'force-dynamic'
 import { stateMachine } from '@/orchestrator/stateMachine'
-import { jdParserAgent } from '@/agents/jdParser'
-import { PipelineStateEnum, PipelineRecordSchema } from '@/schemas/pipeline'
+import { PipelineStateEnum } from '@/schemas/pipeline'
 import { logger } from '@/lib/logger'
 
 const AGENT = 'PipelineTriggerAPI'
@@ -12,20 +12,25 @@ const AGENT = 'PipelineTriggerAPI'
  * Manually advance a pipeline record to a new state.
  * Used by the dashboard for human-in-the-loop overrides.
  *
- * Body: {
- *   record: PipelineRecord,
- *   toState: PipelineState,
- *   notes?: string,
- *   rejectionReason?: string,
- * }
+ * Body: { jobId, candidateId, toState, notes?, rejectionReason? }
+ * Record is loaded from Supabase — client cannot forge state.
  */
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
-    const { record: rawRecord, toState, notes, rejectionReason } = body
+    const { jobId, candidateId, toState, notes, rejectionReason } = body
 
-    const record   = PipelineRecordSchema.parse(rawRecord)
+    if (!jobId || !candidateId || !toState) {
+      return NextResponse.json({ error: 'jobId, candidateId, and toState are required' }, { status: 400 })
+    }
+
     const newState = PipelineStateEnum.parse(toState)
+
+    // Load authoritative record from Supabase
+    const record = await stateMachine.getRecord(jobId, candidateId)
+    if (!record) {
+      return NextResponse.json({ error: `No record found for job=${jobId} candidate=${candidateId}` }, { status: 404 })
+    }
 
     const updated = await stateMachine.transition(record, newState, {
       triggeredBy:     'human',
@@ -34,10 +39,7 @@ export async function POST(req: NextRequest) {
       rejectionReason,
     })
 
-    logger.info(AGENT, `Manual transition: ${record.state} → ${newState}`, {
-      jobId:       record.jobId,
-      candidateId: record.candidateId,
-    })
+    logger.info(AGENT, `Manual transition: ${record.state} → ${newState}`, { jobId, candidateId })
 
     return NextResponse.json({ success: true, record: updated })
   } catch (err) {
